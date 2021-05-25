@@ -2133,9 +2133,9 @@ impl<T: Config> Module<T> {
 			match ForceEra::get() {
 				// Will set to default again, which is `NotForcing`.
 				Forcing::ForceNew => ForceEra::kill(),
-				// Short circuit to `new_era`.
+				// Short circuit to `try_trigger_new_era`.
 				Forcing::ForceAlways => (),
-				// Only go to `new_era` if deadline reached.
+				// Only go to `try_trigger_new_era` if deadline reached.
 				Forcing::NotForcing if era_length >= T::SessionsPerEra::get() => (),
 				_ => {
 					// either `Forcing::ForceNone`,
@@ -2145,11 +2145,11 @@ impl<T: Config> Module<T> {
 			}
 
 			// new era.
-			Self::new_era(session_index)
+			Self::try_trigger_new_era(session_index)
 		} else {
 			// Set initial era
 			log!(debug, "Starting the first era.");
-			Self::new_era(session_index)
+			Self::try_trigger_new_era(session_index)
 		}
 	}
 
@@ -2246,77 +2246,94 @@ impl<T: Config> Module<T> {
 		}
 	}
 
-	/// Plan a new era. Return the potential new staking set.
-	fn new_era(start_session_index: SessionIndex) -> Option<Vec<T::AccountId>> {
+	/// Plan a new era.
+	///
+	/// * Bump the current era storage (which holds the latest planned era).
+	/// * Store start session index for the new planned era.
+	/// * Clean old era information.
+	/// * Store staking information for the new planned era
+	///
+	/// Returns the new validator set.
+	pub fn new_era(
+		start_session_index: SessionIndex,
+		exposures: Vec<(T::AccountId, Exposure<T::AccountId, BalanceOf<T>>)>,
+	) -> Vec<T::AccountId> {
 		// Increment or set current era.
-		let current_era = CurrentEra::mutate(|s| {
+		let new_planned_era = CurrentEra::mutate(|s| {
 			*s = Some(s.map(|s| s + 1).unwrap_or(0));
 			s.unwrap()
 		});
-		ErasStartSessionIndex::insert(&current_era, &start_session_index);
+		ErasStartSessionIndex::insert(&new_planned_era, &start_session_index);
 
 		// Clean old era information.
-		if let Some(old_era) = current_era.checked_sub(Self::history_depth() + 1) {
+		if let Some(old_era) = new_planned_era.checked_sub(Self::history_depth() + 1) {
 			Self::clear_era_information(old_era);
 		}
 
-		// Set staking information for new era.
-		let maybe_new_validators = Self::enact_election(current_era);
-
-		maybe_new_validators
+		// Set staking information for the new era.
+		Self::store_stakers_info(exposures, new_planned_era)
 	}
 
-	/// Enact and process the election using the `ElectionProvider` type.
+	/// Potentially plan a new era.
 	///
-	/// This will also process the election, as noted in [`process_election`].
-	fn enact_election(current_era: EraIndex) -> Option<Vec<T::AccountId>> {
-		T::ElectionProvider::elect()
+	/// Get election result from `T::ElectionProvider`.
+	/// In case election result has more than [`MinimumValidatorCount`] validator trigger a new era.
+	///
+	/// In case a new era is planned, the new validator set is returned.
+	fn try_trigger_new_era(start_session_index: SessionIndex) -> Option<Vec<T::AccountId>> {
+		let (election_result, weight) = T::ElectionProvider::elect()
 			.map_err(|e| {
 				log!(warn, "election provider failed due to {:?}", e)
 			})
-			.and_then(|(res, weight)| {
-				<frame_system::Pallet<T>>::register_extra_weight_unchecked(
-					weight,
-					frame_support::weights::DispatchClass::Mandatory,
-				);
-				Self::process_election(res, current_era)
-			})
-			.ok()
+			.ok()?;
+
+		<frame_system::Pallet<T>>::register_extra_weight_unchecked(
+			weight,
+			frame_support::weights::DispatchClass::Mandatory,
+		);
+
+		let exposures = Self::collect_exposures(election_result);
+		dbg!(&exposures);
+
+		if (exposures.len() as u32) < Self::minimum_validator_count().max(1) {
+			// Session will panic if we ever return an empty validator set, thus max(1) ^^.
+			match CurrentEra::get() {
+				Some(current_era) if current_era > 0 => log!(
+					warn,
+					"chain does not have enough staking candidates to operate for era {:?} ({} \
+					elected, minimum is {})",
+					CurrentEra::get().unwrap_or(0),
+					exposures.len(),
+					Self::minimum_validator_count(),
+				),
+				None => {
+					// The initial era is allowed to have no exposures.
+					CurrentEra::put(Some(0))
+					ErasStartSessionIndex::insert(&0, &start_session_index);
+				},
+				_ => ()
+			}
+
+			return None
+		}
+
+		Some(Self::new_era(start_session_index, exposures))
 	}
 
 	/// Process the output of the election.
 	///
-	/// This ensures enough validators have been elected, converts all supports to exposures and
-	/// writes them to the associated storage.
-	///
-	/// Returns `Err(())` if less than [`MinimumValidatorCount`] validators have been elected, `Ok`
-	/// otherwise.
-	pub fn process_election(
-		flat_supports: frame_election_provider_support::Supports<T::AccountId>,
-		current_era: EraIndex,
-	) -> Result<Vec<T::AccountId>, ()> {
-		let exposures = Self::collect_exposures(flat_supports);
+	/// Store staking information for the new planned era
+	pub fn store_stakers_info(
+		exposures: Vec<(T::AccountId, Exposure<T::AccountId, BalanceOf<T>>)>,
+		new_planned_era: EraIndex,
+	) -> Vec<T::AccountId> {
 		let elected_stashes = exposures.iter().cloned().map(|(x, _)| x).collect::<Vec<_>>();
-
-		if (elected_stashes.len() as u32) < Self::minimum_validator_count().max(1) {
-			// Session will panic if we ever return an empty validator set, thus max(1) ^^.
-			if current_era > 0 {
-				log!(
-					warn,
-					"chain does not have enough staking candidates to operate for era {:?} ({} elected, minimum is {})",
-					current_era,
-					elected_stashes.len(),
-					Self::minimum_validator_count(),
-				);
-			}
-			return Err(());
-		}
 
 		// Populate stakers, exposures, and the snapshot of validator prefs.
 		let mut total_stake: BalanceOf<T> = Zero::zero();
 		exposures.into_iter().for_each(|(stash, exposure)| {
 			total_stake = total_stake.saturating_add(exposure.total);
-			<ErasStakers<T>>::insert(current_era, &stash, &exposure);
+			<ErasStakers<T>>::insert(new_planned_era, &stash, &exposure);
 
 			let mut exposure_clipped = exposure;
 			let clipped_max_len = T::MaxNominatorRewardedPerValidator::get() as usize;
@@ -2324,31 +2341,31 @@ impl<T: Config> Module<T> {
 				exposure_clipped.others.sort_by(|a, b| a.value.cmp(&b.value).reverse());
 				exposure_clipped.others.truncate(clipped_max_len);
 			}
-			<ErasStakersClipped<T>>::insert(&current_era, &stash, exposure_clipped);
+			<ErasStakersClipped<T>>::insert(&new_planned_era, &stash, exposure_clipped);
 		});
 
 		// Insert current era staking information
-		<ErasTotalStake<T>>::insert(&current_era, total_stake);
+		<ErasTotalStake<T>>::insert(&new_planned_era, total_stake);
 
 		// collect the pref of all winners
 		for stash in &elected_stashes {
 			let pref = Self::validators(stash);
-			<ErasValidatorPrefs<T>>::insert(&current_era, stash, pref);
+			<ErasValidatorPrefs<T>>::insert(&new_planned_era, stash, pref);
 		}
 
 		// emit event
 		Self::deposit_event(RawEvent::StakingElection);
 
-		if current_era > 0 {
+		if new_planned_era > 0 {
 			log!(
 				info,
 				"new validator set of size {:?} has been processed for era {:?}",
 				elected_stashes.len(),
-				current_era,
+				new_planned_era,
 			);
 		}
 
-		Ok(elected_stashes)
+		elected_stashes
 	}
 
 	/// Consume a set of [`Supports`] from [`sp_npos_elections`] and collect them into a

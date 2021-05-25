@@ -3211,7 +3211,7 @@ fn set_history_depth_works() {
 fn test_payout_stakers() {
 	// Here we will test validator can set `max_nominators_payout` and it works.
 	// We also test that `payout_extra_nominators` works.
-	ExtBuilder::default().has_stakers(false).build_and_execute(|| {
+	ExtBuilder::default().has_stakers(true).build_and_execute(|| {
 		let balance = 1000;
 		// Create a validator:
 		bond_validator(11, 10, balance); // Default(64)
